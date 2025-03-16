@@ -5,7 +5,7 @@ read -p "Enter your ID: " NEWT_ID
 read -s -p "Enter your Secret: " NEWT_SECRET
 
 # Define endpoint
-ENDPOINT="https://app.s3na.xyz"
+ENDPOINT="https://pangolin.app.s3na.xyz"
 
 # Download Newt
 wget -O newt "https://github.com/fosrl/newt/releases/download/1.1.1/newt_linux_amd64" && chmod +x ./newt
