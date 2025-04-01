@@ -98,9 +98,9 @@ EOL
 # Change to the app directory
 cd $APP_PATH || exit
 
-# Start the application
+# Start the application in foreground
 echo "Starting $APP_NAME..."
-$APP_COMMAND &
+exec $APP_COMMAND
 EOL
     fi
 
@@ -119,6 +119,7 @@ After=network.target
 Type=simple
 ExecStart=$START_SCRIPT
 Restart=always
+RestartSec=5
 User=root
 WorkingDirectory=$APP_PATH
 StandardOutput=journal
