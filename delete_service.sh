@@ -40,13 +40,20 @@ else
     exit 1
 fi
 
+# Find the associated start script from the service file
+START_SCRIPT_PATH=$(grep -oP '^ExecStart=\K.*' "$SERVICE_FILE" | sed 's/\.sh$//')
+
+if [ -z "$START_SCRIPT_PATH" ]; then
+    echo "Error: Could not find the start script path from the service file."
+    exit 1
+fi
+
 # Remove the associated start script
-START_SCRIPT="/your/app/path/start-$SERVICE_NAME.sh"
-if [ -f "$START_SCRIPT" ]; then
-    echo "Deleting start script: $START_SCRIPT"
-    rm -f "$START_SCRIPT"
+if [ -f "$START_SCRIPT_PATH" ]; then
+    echo "Deleting start script: $START_SCRIPT_PATH"
+    rm -f "$START_SCRIPT_PATH"
 else
-    echo "Error: Start script not found: $START_SCRIPT"
+    echo "Error: Start script not found: $START_SCRIPT_PATH"
     exit 1
 fi
 
