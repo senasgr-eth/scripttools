@@ -1,5 +1,16 @@
 #!/bin/bash
 
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" &> /dev/null
+}
+
+# Ensure node and npm are available
+if ! command_exists node || ! command_exists npm; then
+    echo "Error: Node.js and npm must be installed."
+    exit 1
+fi
+
 # Prompt for the number of applications
 read -p "How many applications do you want to run? " APP_COUNT
 
@@ -63,6 +74,11 @@ do
         cat > "$START_SCRIPT" <<EOL
 #!/bin/bash
 
+# Load NVM if available
+export NVM_DIR="\$HOME/.nvm"
+[ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh"
+[ -s "\$NVM_DIR/bash_completion" ] && \. "\$NVM_DIR/bash_completion"
+
 # Navigate to Eiquidus directory
 cd $APP_PATH || exit
 
@@ -94,6 +110,11 @@ EOL
         # Default start script for other applications
         cat > "$START_SCRIPT" <<EOL
 #!/bin/bash
+
+# Load NVM if available
+export NVM_DIR="\$HOME/.nvm"
+[ -s "\$NVM_DIR/nvm.sh" ] && \. "\$NVM_DIR/nvm.sh"
+[ -s "\$NVM_DIR/bash_completion" ] && \. "\$NVM_DIR/bash_completion"
 
 # Change to the app directory
 cd $APP_PATH || exit
