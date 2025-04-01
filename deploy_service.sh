@@ -3,7 +3,7 @@
 # Prompt for the number of applications
 read -p "How many applications do you want to run? " APP_COUNT
 
-# Check if the input is a valid number
+# Validate input
 if ! [[ "$APP_COUNT" =~ ^[0-9]+$ ]]; then
     echo "Error: Please enter a valid number."
     exit 1
@@ -19,9 +19,18 @@ for (( i=1; i<=APP_COUNT; i++ ))
 do
     echo ""
     read -p "Enter the name for application #$i (e.g., eiquidus): " APP_NAME
-    read -p "Enter the working directory for $APP_NAME: " APP_PATH
 
-    # Check if the user is setting up Eiquidus
+    # Validate path and keep asking until a valid one is provided
+    while true; do
+        read -p "Enter the working directory for $APP_NAME: " APP_PATH
+        if [ -d "$APP_PATH" ]; then
+            break
+        else
+            echo "Error: Directory $APP_PATH does not exist! Please enter a valid path."
+        fi
+    done
+
+    # Special handling for Eiquidus
     if [[ "$APP_NAME" == "eiquidus" ]]; then
         echo "Detected Eiquidus setup. Using special command set..."
         APP_COMMAND="npm run start"
@@ -29,13 +38,7 @@ do
         read -p "Enter the command to run $APP_NAME: " APP_COMMAND
     fi
 
-    # Validate input
-    if [ ! -d "$APP_PATH" ]; then
-        echo "Error: Directory $APP_PATH does not exist!"
-        exit 1
-    fi
-
-    # Store inputs in arrays
+    # Store inputs
     APP_NAMES[$i]="$APP_NAME"
     APP_PATHS[$i]="$APP_PATH"
     APP_COMMANDS[$i]="$APP_COMMAND"
