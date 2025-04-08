@@ -45,3 +45,6 @@ for FROM_CASE in "${!CASE_MAP[@]}"; do
 done
 
 echo "✅ All replacements complete."
+
+
+# ./replace_cases.sh dogecoin junkcoin /root/myfolder
