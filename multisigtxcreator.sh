@@ -27,6 +27,95 @@ if [ -z "$BINARY" ]; then
 fi
 echo "Using CLI binary: $BINARY"
 
+# Function to fetch UTXOs in batches
+fetch_utxos_batched() {
+  local address=$1
+  local batch_size=${2:-1000}  # Default batch size of 1000 UTXOs per request
+  local min_conf=${3:-1}      # Default minimum confirmations
+  local max_conf=${4:-9999999} # Default maximum confirmations
+  
+  # Initialize variables
+  local all_utxos="[]"
+  local batch_count=0
+  local total_count=0
+  local more_utxos=true
+  local last_txid=""
+  local last_vout=0
+  
+  echo "Fetching UTXOs in batches of $batch_size..."
+  
+  # Loop until we've fetched all UTXOs
+  while $more_utxos; do
+    local batch
+    
+    if [ -z "$last_txid" ]; then
+      # First batch
+      batch=$($BINARY listunspent $min_conf $max_conf "[\"$address\"]" 2>/dev/null)
+    else
+      # Subsequent batches - use paging with last txid/vout as reference
+      # Note: This assumes the blockchain client supports paging parameters
+      # If not, we'll need to use a different approach
+      batch=$($BINARY listunspent $min_conf $max_conf "[\"$address\"]" $batch_size "$last_txid" $last_vout 2>/dev/null)
+      
+      # If the client doesn't support paging, try this alternative approach
+      if [ $? -ne 0 ] || [ -z "$batch" ]; then
+        # Get all UTXOs and use jq to handle paging manually
+        batch=$($BINARY listunspent $min_conf $max_conf "[\"$address\"]" 2>/dev/null | 
+               jq --arg last_txid "$last_txid" --arg last_vout "$last_vout" --arg batch_size "$batch_size" 
+               'sort_by(.txid, .vout) | 
+                if $last_txid != "" then
+                  # Find the position after the last item we processed
+                  [.[] | select(.txid > $last_txid or (.txid == $last_txid and .vout > ($last_vout | tonumber)))]
+                else
+                  .
+                end | 
+                # Take only batch_size items
+                .[0:($batch_size | tonumber)]')
+      fi
+    fi
+    
+    # Check if we got any UTXOs in this batch
+    if [ -z "$batch" ] || [ "$batch" == "[]" ] || [ "$batch" == "null" ]; then
+      more_utxos=false
+      break
+    fi
+    
+    # Count UTXOs in this batch
+    local batch_size_actual=$(echo "$batch" | jq -r 'length')
+    if [ "$batch_size_actual" == "0" ]; then
+      more_utxos=false
+      break
+    fi
+    
+    # Merge with existing UTXOs
+    all_utxos=$(echo "$all_utxos" "$batch" | jq -s 'add')
+    
+    # Update counters
+    batch_count=$((batch_count + 1))
+    total_count=$(echo "$all_utxos" | jq -r 'length')
+    
+    echo "  Fetched batch $batch_count: $batch_size_actual UTXOs (total: $total_count)"
+    
+    # Get the last TXID and VOUT for the next batch
+    last_txid=$(echo "$batch" | jq -r '.[-1].txid')
+    last_vout=$(echo "$batch" | jq -r '.[-1].vout')
+    
+    # Check if we got fewer UTXOs than the batch size, which means we're done
+    if [ "$batch_size_actual" -lt "$batch_size" ]; then
+      more_utxos=false
+    fi
+    
+    # Safety check to prevent infinite loops
+    if [ "$batch_count" -gt 100 ]; then
+      echo "Warning: Reached maximum batch count (100). Some UTXOs may not be included."
+      more_utxos=false
+    fi
+  done
+  
+  # Sort UTXOs by amount (largest first) for better selection
+  echo "$all_utxos" | jq 'sort_by(-.amount)'
+}
+
 # Function to fetch balance and UTXO count in the background
 fetch_balance_utxos() {
   if [ -n "$P2SH_ADDRESS" ]; then
@@ -37,7 +126,10 @@ fetch_balance_utxos() {
       echo "UTXOs: Invalid P2SH address" >> /tmp/balance_utxo_status
       return
     fi
-    UTXOS=$($BINARY listunspent 1 9999999 "[\"$P2SH_ADDRESS\"]" 2>/dev/null)
+    
+    # Use batched UTXO fetching
+    UTXOS=$(fetch_utxos_batched "$P2SH_ADDRESS" 1000)
+    
     if [ -n "$UTXOS" ] && [ "$UTXOS" != "[]" ]; then
       TOTAL_AMOUNT=$(echo "$UTXOS" | jq -r '.[] | .amount' | awk '{s+=$1} END {print s}' 2>/dev/null)
       UTXO_COUNT=$(echo "$UTXOS" | jq -r 'length' 2>/dev/null)
@@ -145,7 +237,7 @@ consolidate_utxos() {
 
   # Step 1: Check balance and get UTXOs, sorted by amount (largest first)
   echo "Checking unspent transactions for $P2SH_ADDRESS..."
-  UTXOS=$($BINARY listunspent 1 9999999 "[\"$P2SH_ADDRESS\"]" 2>/dev/null | jq 'sort_by(-.amount)')
+  UTXOS=$(fetch_utxos_batched "$P2SH_ADDRESS" 1000)
   if [ -z "$UTXOS" ] || [ "$UTXOS" == "[]" ]; then
     echo "Error: No unspent transactions found for $P2SH_ADDRESS."
     return 1
@@ -274,10 +366,16 @@ consolidate_utxos() {
     SIG_COUNT=$((SIG_COUNT + INPUT_SIGS))
   done
 
-    # Step 7: Save signed batch to JSON file
-    JSON_FILE="tx_consolidate_batch_${BATCH_NUM}_$(date +%Y%m%d_%H%M%S).json"
+    # Step 7: Save signed batch to JSON file with descriptive name
+    JSON_FILE="consolidate_batch${BATCH_NUM}_$(date +%Y%m%d_%H%M%S).json"
     echo "Saving batch $BATCH_NUM transaction details to $JSON_FILE..."
-    echo "{\"p2sh_address\":\"$P2SH_ADDRESS\", \"redeem_script\":\"$REDEEM_SCRIPT\", \"inputs\":[$INPUTS], \"signed_hex\":\"$SIGNED_HEX\", \"complete\":$COMPLETE, \"signatures\":$SIG_COUNT, \"required_signatures\":$REQSIGS}" > "$JSON_FILE"
+    
+    # If this is the final signature (transaction is complete), only save hex for broadcasting
+    if [ "$COMPLETE" == "true" ]; then
+      echo "{\"p2sh_address\":\"$P2SH_ADDRESS\", \"redeem_script\":\"$REDEEM_SCRIPT\", \"signed_hex\":\"$SIGNED_HEX\", \"complete\":$COMPLETE, \"signatures\":$SIG_COUNT, \"required_signatures\":$REQSIGS}" > "$JSON_FILE"
+    else
+      echo "{\"p2sh_address\":\"$P2SH_ADDRESS\", \"redeem_script\":\"$REDEEM_SCRIPT\", \"inputs\":[$INPUTS], \"signed_hex\":\"$SIGNED_HEX\", \"complete\":$COMPLETE, \"signatures\":$SIG_COUNT, \"required_signatures\":$REQSIGS}" > "$JSON_FILE"
+    fi
 
     if [ "$COMPLETE" == "true" ]; then
       echo "Batch $BATCH_NUM fully signed with $SIG_COUNT signatures!"
@@ -345,7 +443,7 @@ create_send_transaction() {
     return 1
   fi
   echo "Checking unspent transactions for $P2SH_ADDRESS..."
-  UTXOS=$($BINARY listunspent 1 9999999 "[\"$P2SH_ADDRESS\"]" 2>/dev/null | jq 'sort_by(-.amount)')
+  UTXOS=$(fetch_utxos_batched "$P2SH_ADDRESS" 1000)
   if [ -z "$UTXOS" ] || [ "$UTXOS" == "[]" ]; then
     echo "Error: No unspent transactions found for $P2SH_ADDRESS."
     return 1
@@ -438,10 +536,18 @@ create_send_transaction() {
     INPUT_SIGS=$(echo "$DECODED" | jq -r ".vin[$i].scriptSig.asm" | tr ' ' '\n' | grep -E '^[0-9a-fA-F]{60,144}$' | wc -l)
     SIG_COUNT=$((SIG_COUNT + INPUT_SIGS))
   done
-  JSON_FILE="tx_create_$(date +%Y%m%d_%H%M%S).json"
+  # Create descriptive filename based on transaction details
+  AMOUNT_SHORT=$(echo "$AMOUNT_TO_SEND" | sed 's/\..*//')
+  JSON_FILE="send_${AMOUNT_SHORT}coin_$(date +%Y%m%d_%H%M%S).json"
   echo "Saving transaction details to $JSON_FILE..."
-  # Format the JSON file with proper inputs array
-  echo "{\"p2sh_address\":\"$P2SH_ADDRESS\", \"redeem_script\":\"$REDEEM_SCRIPT\", \"inputs\":[$INPUTS], \"signed_hex\":\"$SIGNED_HEX\", \"complete\":$COMPLETE, \"signatures\":$SIG_COUNT, \"required_signatures\":$REQSIGS}" > "$JSON_FILE"
+  
+  # If this is the final signature (transaction is complete), only save hex for broadcasting
+  if [ "$COMPLETE" == "true" ]; then
+    echo "{\"p2sh_address\":\"$P2SH_ADDRESS\", \"redeem_script\":\"$REDEEM_SCRIPT\", \"signed_hex\":\"$SIGNED_HEX\", \"complete\":$COMPLETE, \"signatures\":$SIG_COUNT, \"required_signatures\":$REQSIGS}" > "$JSON_FILE"
+  else
+    # Format the JSON file with proper inputs array for partial signing
+    echo "{\"p2sh_address\":\"$P2SH_ADDRESS\", \"redeem_script\":\"$REDEEM_SCRIPT\", \"inputs\":[$INPUTS], \"signed_hex\":\"$SIGNED_HEX\", \"complete\":$COMPLETE, \"signatures\":$SIG_COUNT, \"required_signatures\":$REQSIGS}" > "$JSON_FILE"
+  fi
   if [ "$COMPLETE" == "true" ]; then
     echo "Transaction fully signed with $SIG_COUNT signatures!"
     echo "Signed transaction hex: $SIGNED_HEX"
@@ -481,19 +587,39 @@ sign_partial_tx() {
   fi
   read -p "Use JSON file for input? (y/n): " USE_JSON
   if [ "$USE_JSON" = "y" ]; then
-    read -p "Enter JSON file path: " JSON_FILE
+    # List all JSON files in current directory for easy selection
+    echo "Available JSON files in current directory:"
+    ls -1 *.json 2>/dev/null | grep -E '^(send|consolidate|sign).*\.json$' | cat -n
+    
+    read -p "Enter JSON file path or number from list: " JSON_INPUT
+    
+    # Check if input is a number referring to the list
+    if [[ "$JSON_INPUT" =~ ^[0-9]+$ ]]; then
+      JSON_FILE=$(ls -1 *.json 2>/dev/null | grep -E '^(send|consolidate|sign).*\.json$' | sed -n "${JSON_INPUT}p")
+      if [ -z "$JSON_FILE" ]; then
+        echo "Error: Invalid selection number."
+        return 1
+      fi
+      echo "Selected: $JSON_FILE"
+    else
+      JSON_FILE="$JSON_INPUT"
+    fi
+    
     if [ ! -f "$JSON_FILE" ]; then
       echo "Error: File $JSON_FILE not found."
       return 1
     fi
+    
     RAW_TX=$(jq -r '.signed_hex' "$JSON_FILE")
     INPUTS=$(jq -r '.inputs' "$JSON_FILE")
     FILE_P2SH=$(jq -r '.p2sh_address' "$JSON_FILE")
     FILE_REDEEM=$(jq -r '.redeem_script' "$JSON_FILE")
-    if [ -z "$RAW_TX" ] || [ -z "$INPUTS" ]; then
+    
+    if [ -z "$RAW_TX" ] || [ "$RAW_TX" = "null" ] || [ -z "$INPUTS" ] || [ "$INPUTS" = "null" ]; then
       echo "Error: Invalid JSON file. Missing signed_hex or inputs."
       return 1
     fi
+    
     if [ "$FILE_P2SH" != "$P2SH_ADDRESS" ] || [ "$FILE_REDEEM" != "$REDEEM_SCRIPT" ]; then
       echo "Warning: P2SH address or redeem script in JSON differs from provided values."
       read -p "Proceed with JSON values? (y/n): " PROCEED
@@ -502,6 +628,7 @@ sign_partial_tx() {
         REDEEM_SCRIPT="$FILE_REDEEM"
       fi
     fi
+    
     echo "Loaded transaction from $JSON_FILE"
   else
     read -p "Enter the partially signed transaction hex: " RAW_TX
@@ -526,6 +653,14 @@ sign_partial_tx() {
     echo "Error: No private key provided."
     return 1
   fi
+  # Check if this private key has already been used to sign this transaction
+  echo "Checking for duplicate signatures..."
+  check_if_already_signed "$RAW_TX" "$PRIVATE_KEY" "$REDEEM_SCRIPT"
+  if [ $? -eq 1 ]; then
+    echo "Aborting: Transaction already signed with this private key."
+    return 1
+  fi
+  
   echo "Signing with private key (partial signature)..."
   # Make sure INPUTS is properly formatted as a JSON array
   echo "Debug: Using inputs for signing: $INPUTS"
@@ -548,10 +683,31 @@ sign_partial_tx() {
     INPUT_SIGS=$(echo "$DECODED" | jq -r ".vin[$i].scriptSig.asm" | tr ' ' '\n' | grep -E '^[0-9a-fA-F]{60,144}$' | wc -l)
     SIG_COUNT=$((SIG_COUNT + INPUT_SIGS))
   done
-  JSON_FILE="tx_sign_$(date +%Y%m%d_%H%M%S).json"
+  # Extract transaction info for filename
+  # Try to get original filename prefix if it exists
+  if [ "$USE_JSON" = "y" ] && [ -f "$JSON_FILE" ]; then
+    FILENAME_BASE=$(basename "$JSON_FILE" | sed 's/_[0-9]\{8\}_[0-9]\{6\}\.json$//')
+    # If it starts with 'send_' or 'consolidate_', keep the prefix
+    if [[ "$FILENAME_BASE" =~ ^(send|consolidate) ]]; then
+      PREFIX="$FILENAME_BASE"
+    else
+      PREFIX="sign"
+    fi
+  else
+    PREFIX="sign"
+  fi
+  
+  # Create descriptive filename
+  JSON_FILE="${PREFIX}_$(date +%Y%m%d_%H%M%S).json"
   echo "Saving transaction details to $JSON_FILE..."
-  # Format the JSON file with proper inputs
-  echo "{\"p2sh_address\":\"$P2SH_ADDRESS\", \"redeem_script\":\"$REDEEM_SCRIPT\", \"inputs\":$INPUTS, \"signed_hex\":\"$SIGNED_HEX\", \"complete\":$COMPLETE, \"signatures\":$SIG_COUNT, \"required_signatures\":$REQSIGS}" > "$JSON_FILE"
+  
+  # If this is the final signature (transaction is complete), only save hex for broadcasting
+  if [ "$COMPLETE" == "true" ]; then
+    echo "{\"p2sh_address\":\"$P2SH_ADDRESS\", \"redeem_script\":\"$REDEEM_SCRIPT\", \"signed_hex\":\"$SIGNED_HEX\", \"complete\":$COMPLETE, \"signatures\":$SIG_COUNT, \"required_signatures\":$REQSIGS}" > "$JSON_FILE"
+  else
+    # Format the JSON file with proper inputs for partial signing
+    echo "{\"p2sh_address\":\"$P2SH_ADDRESS\", \"redeem_script\":\"$REDEEM_SCRIPT\", \"inputs\":$INPUTS, \"signed_hex\":\"$SIGNED_HEX\", \"complete\":$COMPLETE, \"signatures\":$SIG_COUNT, \"required_signatures\":$REQSIGS}" > "$JSON_FILE"
+  fi
   if [ "$COMPLETE" == "true" ]; then
     echo "Transaction fully signed with $SIG_COUNT signatures!"
     echo "Signed transaction hex: $SIGNED_HEX"
@@ -571,42 +727,225 @@ sign_partial_tx() {
   fi
 }
 
+# Function to check if a private key has already been used to sign a transaction
+check_if_already_signed() {
+  local tx_hex=$1
+  local private_key=$2
+  local redeem_script=$3
+  
+  # Get the address from the private key
+  local address=""
+  address=$($BINARY dumpprivkey "$private_key" 2>/dev/null)
+  if [ $? -ne 0 ]; then
+    # If dumpprivkey fails, try to derive the address another way
+    # This is just a best-effort check, so we'll continue if it fails
+    echo "Info: Checking for existing signatures in transaction..."
+    
+    # Just count signatures and show info
+    local decoded=$($BINARY decoderawtransaction "$tx_hex" 2>/dev/null)
+    if [ -z "$decoded" ]; then
+      echo "Warning: Failed to decode transaction."
+      return 0 # Allow signing to continue
+    fi
+    
+    # Count signatures in all inputs
+    local sig_count=0
+    local vin_count=$(echo "$decoded" | jq -r '.vin | length')
+    for i in $(seq 0 $((vin_count - 1))); do
+      local script_sig=$(echo "$decoded" | jq -r ".vin[$i].scriptSig.hex" 2>/dev/null)
+      if [ -n "$script_sig" ] && [ "$script_sig" != "null" ] && [ "$script_sig" != "" ]; then
+        # Count signature-like patterns in the script
+        local sigs=$(echo "$script_sig" | grep -o -E '30[0-9a-fA-F]{2}[0-9a-fA-F]{64,}' | wc -l)
+        sig_count=$((sig_count + sigs))
+      fi
+    done
+    
+    # Show signature count info
+    if [ $sig_count -gt 0 ]; then
+      echo "Info: Transaction already has $sig_count signature(s)."
+    fi
+    
+    return 0 # Allow signing to proceed since we can't verify the key
+  fi
+  
+  # Try to get the public key from the private key
+  # First, temporarily import the key to get its public key
+  local temp_result=$($BINARY importprivkey "$private_key" "temp_check" true 2>/dev/null)
+  local pub_key=""
+  local key_addr=$($BINARY getaddressesbylabel "temp_check" 2>/dev/null | jq -r 'keys[0]' 2>/dev/null)
+  if [ -n "$key_addr" ] && [ "$key_addr" != "null" ]; then
+    pub_key=$($BINARY validateaddress "$key_addr" 2>/dev/null | jq -r '.pubkey' 2>/dev/null)
+    # Clean up temporary import
+    $BINARY removelabel "temp_check" 2>/dev/null
+  fi
+  
+  if [ -z "$pub_key" ] || [ "$pub_key" = "null" ]; then
+    # If we couldn't get the public key, just show signature count
+    echo "Info: Checking for existing signatures in transaction..."
+    
+    # Decode transaction to check signatures
+    local decoded=$($BINARY decoderawtransaction "$tx_hex" 2>/dev/null)
+    if [ -z "$decoded" ]; then
+      echo "Warning: Failed to decode transaction."
+      return 0 # Allow signing to continue
+    fi
+    
+    # Count signatures in all inputs
+    local sig_count=0
+    local vin_count=$(echo "$decoded" | jq -r '.vin | length')
+    for i in $(seq 0 $((vin_count - 1))); do
+      local script_sig=$(echo "$decoded" | jq -r ".vin[$i].scriptSig.asm" 2>/dev/null)
+      if [ -n "$script_sig" ]; then
+        # Count signatures in the script
+        local sigs=$(echo "$script_sig" | tr ' ' '\n' | grep -E '^[0-9a-fA-F]{60,144}$' | wc -l)
+        sig_count=$((sig_count + sigs))
+      fi
+    done
+    
+    # Show signature count info
+    if [ $sig_count -gt 0 ]; then
+      echo "Info: Transaction already has $sig_count signature(s)."
+    fi
+    
+    return 0 # Allow signing to proceed since we can't verify the key
+  fi
+  
+  # Now check if this public key is already in any of the signatures
+  local decoded=$($BINARY decoderawtransaction "$tx_hex" 2>/dev/null)
+  if [ -z "$decoded" ]; then
+    echo "Warning: Failed to decode transaction."
+    return 0 # Allow signing to continue
+  fi
+  
+  # Check each input for this public key
+  local vin_count=$(echo "$decoded" | jq -r '.vin | length')
+  local found_key=0
+  
+  for i in $(seq 0 $((vin_count - 1))); do
+    local script_sig=$(echo "$decoded" | jq -r ".vin[$i].scriptSig.asm" 2>/dev/null)
+    
+    # Check if this public key is in the script
+    if [ -n "$script_sig" ] && [[ "$script_sig" == *"$pub_key"* ]]; then
+      found_key=1
+      break
+    fi
+  done
+  
+  if [ $found_key -eq 1 ]; then
+    echo "Error: This transaction has already been signed with this private key."
+    echo "Signing canceled to prevent duplicate signatures."
+    return 1 # Automatically cancel signing when duplicate detected
+  else
+    # Count total signatures for information
+    local sig_count=0
+    for i in $(seq 0 $((vin_count - 1))); do
+      local script_sig=$(echo "$decoded" | jq -r ".vin[$i].scriptSig.asm" 2>/dev/null)
+      if [ -n "$script_sig" ]; then
+        # Count signatures in the script
+        local sigs=$(echo "$script_sig" | tr ' ' '\n' | grep -E '^[0-9a-fA-F]{60,144}$' | wc -l)
+        sig_count=$((sig_count + sigs))
+      fi
+    done
+    
+    if [ $sig_count -gt 0 ]; then
+      echo "Info: Transaction already has $sig_count signature(s), but not from this key."
+    fi
+  fi
+  
+  return 0 # Allow signing to proceed
+}
+
 # Function to broadcast the final transaction
 broadcast_final_tx() {
   echo "=== Broadcast Final Transaction ==="
   read -p "Use JSON file for input? (y/n): " USE_JSON
   if [ "$USE_JSON" = "y" ]; then
-    read -p "Enter JSON file path: " JSON_FILE
+    # List all JSON files in current directory for easy selection
+    echo "Available JSON files in current directory:"
+    ls -1 *.json 2>/dev/null | grep -E '^(send|consolidate|sign).*\.json$' | cat -n
+    
+    read -p "Enter JSON file path or number from list: " JSON_INPUT
+    
+    # Check if input is a number referring to the list
+    if [[ "$JSON_INPUT" =~ ^[0-9]+$ ]]; then
+      JSON_FILE=$(ls -1 *.json 2>/dev/null | grep -E '^(send|consolidate|sign).*\.json$' | sed -n "${JSON_INPUT}p")
+      if [ -z "$JSON_FILE" ]; then
+        echo "Error: Invalid selection number."
+        return 1
+      fi
+      echo "Selected: $JSON_FILE"
+    else
+      JSON_FILE="$JSON_INPUT"
+    fi
+    
     if [ ! -f "$JSON_FILE" ]; then
       echo "Error: File $JSON_FILE not found."
       return 1
     fi
+    
     SIGNED_HEX=$(jq -r '.signed_hex' "$JSON_FILE")
-    COMPLETE=$(jq -r '.complete' "$JSON_FILE")
-    if [ -z "$SIGNED_HEX" ]; then
+    if [ -z "$SIGNED_HEX" ] || [ "$SIGNED_HEX" = "null" ]; then
       echo "Error: Invalid JSON file. Missing signed_hex."
       return 1
     fi
+    
+    # Check if transaction is complete
+    COMPLETE=$(jq -r '.complete' "$JSON_FILE")
     if [ "$COMPLETE" != "true" ]; then
-      echo "Error: Transaction in $JSON_FILE is not fully signed (complete: $COMPLETE)."
+      echo "Warning: Transaction in $JSON_FILE is not fully signed."
+      read -p "Proceed anyway? (y/n): " PROCEED
+      if [ "$PROCEED" != "y" ]; then
+        echo "Aborted."
+        return 1
+      fi
+    fi
+  else
+    read -p "Enter the signed transaction hex: " SIGNED_HEX
+    if [ -z "$SIGNED_HEX" ]; then
+      echo "Error: No transaction hex provided."
       return 1
     fi
-    echo "Loaded transaction from $JSON_FILE"
-  else
-    read -p "Enter the transaction hex: " SIGNED_HEX
   fi
-  if [ -z "$SIGNED_HEX" ]; then
-    echo "Error: No transaction hex provided."
+  
+  echo "Decoding transaction to verify..."
+  DECODED=$($BINARY decoderawtransaction "$SIGNED_HEX" 2>/dev/null)
+  if [ -z "$DECODED" ]; then
+    echo "Error: Failed to decode transaction. Check hex or $BINARY."
     return 1
   fi
-  echo "Sending transaction..."
-  TXID=$($BINARY sendrawtransaction "$SIGNED_HEX" 2>&1)
-  if [[ "$TXID" =~ ^error ]]; then
-    echo "Error: Failed to send transaction: $TXID"
+  
+  # Show more detailed transaction information
+  TX_TYPE=$(echo "$DECODED" | jq -r '.vout[0].scriptPubKey.type')
+  TX_ADDRESSES=$(echo "$DECODED" | jq -r '.vout[].scriptPubKey.addresses[]' 2>/dev/null)
+  TX_AMOUNTS=$(echo "$DECODED" | jq -r '.vout[].value')
+  TX_FEE="Unknown" # Calculate fee if possible
+  
+  echo "Transaction details:"
+  echo "Type: $TX_TYPE"
+  echo "Addresses: $TX_ADDRESSES"
+  echo "Amounts: $TX_AMOUNTS"
+  echo "Estimated Fee: $TX_FEE"
+  
+  read -p "Broadcast this transaction? (y/n): " CONFIRM
+  if [ "$CONFIRM" != "y" ]; then
+    echo "Broadcast cancelled."
     return 1
   fi
-  echo "Success! Transaction ID: $TXID"
-  echo "Check status with: $BINARY gettransaction \"$TXID\""
+  
+  echo "Broadcasting transaction..."
+  TXID=$($BINARY sendrawtransaction "$SIGNED_HEX" 2>/dev/null)
+  if [ -z "$TXID" ] || [[ "$TXID" =~ ^error ]]; then
+    echo "Error: Failed to broadcast transaction. Output: $TXID"
+    return 1
+  fi
+  
+  # Save broadcast result to JSON file
+  BROADCAST_JSON="broadcast_$(date +%Y%m%d_%H%M%S).json"
+  echo "{\"txid\":\"$TXID\", \"hex\":\"$SIGNED_HEX\", \"broadcast_time\":\"$(date)\"}" > "$BROADCAST_JSON"
+  
+  echo "Success! Transaction broadcast with TXID: $TXID"
+  echo "Transaction details saved to: $BROADCAST_JSON"
+  echo "You can check the status with: $BINARY gettransaction $TXID"
 }
 
 # Main menu
